@@ -1,5 +1,680 @@
-trigger: none
+name: Fabric CI/CD
 
-pool: 
-vmImage: ubuntu-latest
+# Original Azure DevOps pipeline had `trigger: none` (manual-only).
+# workflow_dispatch is the GitHub Actions equivalent of a manually triggered pipeline.
+on:
+  workflow_dispatch:
+    inputs:
+      commit_id:
+        description: 'Commit to publish artifacts from'
+        required: false
+        default: 'publish-artifacts-in-last-commit'
+        type: string
 
+env:
+  # Secrets — set these in repo/org Settings > Secrets and variables > Actions.
+  # Do NOT hardcode the client secret in this file.
+  FABRIC_CLIENT_ID: ${{ secrets.FABRIC_CLIENT_ID }}
+  FABRIC_CLIENT_SECRET: ${{ secrets.FABRIC_CLIENT_SECRET }}
+  FABRIC_TENANT_ID: ${{ secrets.FABRIC_TENANT_ID }}
+  FABRIC_DEV_PROJECT_ID: '08140d58-5dec-4122-b14e-e9ef3c22a334'
+  FABRIC_DEV_DEFINITION_ID: '80'
+
+jobs:
+  # ---------------------------------------------------------------------
+  # STAGE: build
+  # ---------------------------------------------------------------------
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      # Azure DevOps' DownloadPipelineArtifact@2 pulled an artifact from a
+      # *different* pipeline/run. actions/download-artifact only pulls from
+      # THIS workflow by default, so cross-pipeline downloads need either
+      # the GitHub API or a third-party action such as dawidd6/action-download-artifact.
+      - name: Download source-branch-artifact (from other pipeline)
+        if: github.ref == 'refs/heads/dev'
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: <upstream-workflow-file>.yml   # TODO: set the workflow filename that produces this artifact
+          workflow_conclusion: success
+          name: source-branch-artifact
+          path: ${{ github.workspace }}/pipeline-workspace
+
+      - name: Determine Source and Target Workspaces
+        shell: pwsh
+        run: |
+          Write-Host "##[group]Branch Workspace Mapping"
+          $branchName = "${{ github.ref_name }}"
+          Write-Host "Detected Branch: $branchName"
+
+          if ($branchName -eq "main") {
+            "SourceWorkspace=Fabric_DEV_inc" | Out-File -FilePath $env:GITHUB_ENV -Append
+            "TargetWorkspace=Fabric_Test_inc" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+          # elseif ($branchName -eq "uat") {
+          #   "SourceWorkspace=GIT-POC-DEV" | Out-File -FilePath $env:GITHUB_ENV -Append
+          #   "TargetWorkspace=GIT-POC-UAT" | Out-File -FilePath $env:GITHUB_ENV -Append
+          # }
+          else {
+            Write-Error "Unsupported branch: $branchName"
+            exit 1
+          }
+          Write-Host "##[endgroup]"
+
+      - name: Source and Target Workspace Name
+        run: |
+          echo "Source Workspace Name: $SourceWorkspace"
+          echo "Target Workspace Name: $TargetWorkspace"
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: 'x64'
+
+      - name: Upgrade pip and Install Fabric-CLI
+        run: |
+          python -m pip install --upgrade pip
+          pip install ms-fabric-cli
+          pip install argparse
+          pip install requests
+          pip install azure.identity
+          pip install fabric-cicd
+
+      - name: Authentication using Service Principal
+        run: |
+          fab config set encryption_fallback_enabled true
+          fab auth login -u "$FABRIC_CLIENT_ID" -p "$FABRIC_CLIENT_SECRET" --tenant "$FABRIC_TENANT_ID"
+
+      - name: Set COMMIT_ID from github.sha
+        if: ${{ github.event.inputs.commit_id == 'publish-artifacts-in-last-commit' }}
+        run: |
+          echo "Setting commit"
+          echo "COMMIT_ID=${{ github.sha }}" >> "$GITHUB_ENV"
+
+      - name: Classify Fabric items by full path to component folder
+        continue-on-error: true
+        run: |
+          echo "Listing all files in current branch"
+
+          git ls-tree -r --name-only HEAD > all_files.txt
+          cat all_files.txt
+
+          echo "Extracting component folder paths (e.g., Azure_DevOps/note1.Notebook)"
+
+          get_component_paths() {
+            pattern=$1
+            output_file=$2
+
+            grep -E "(^|/)[^/]+\.${pattern}/" all_files.txt \
+            | awk -v pattern="$pattern" -F"/" '
+              {
+                for (i=1; i<=NF; i++) {
+                  if ($i ~ ("\\." pattern "$")) {
+                    path = $1
+                    for (j=2; j<=i; j++) {
+                      path = path "/" $j
+                    }
+                    print path
+                    break
+                  }
+                }
+              }' | sort -u > "$output_file"
+          }
+          get_component_paths "Notebook" notebook_changed_items.txt
+          get_component_paths "Lakehouse" lakehouse_changed_items.txt
+          get_component_paths "SemanticModel" semantic_model_changed_items.txt
+          get_component_paths "DataPipeline" datapipeline_changed_items.txt
+          get_component_paths "Dataflow" dataflow_changed_items.txt
+          get_component_paths "KQLQuerySet" kqlqueryset_changed_items.txt
+          get_component_paths "Warehouse" warehouse_changed_items.txt
+          get_component_paths "Report" report_changed_items.txt
+          get_component_paths "PaginatedReport" paginatedreport_changed_items.txt
+          get_component_paths "DataWarehouse" datawarehouse_changed_items.txt
+
+          echo "Notebook component folders:"; cat notebook_changed_items.txt
+          echo "Lakehouse component folders:"; cat lakehouse_changed_items.txt
+          echo "Semantic Model component folders:"; cat semantic_model_changed_items.txt
+          echo "Report component folders:"; cat report_changed_items.txt
+          echo "datapipeline component folders:"; cat datapipeline_changed_items.txt
+          echo "kqlqueryset component folders:"; cat kqlqueryset_changed_items.txt
+          echo "Warehouse component folders:"; cat warehouse_changed_items.txt
+          echo "paginatedreport component folders:"; cat paginatedreport_changed_items.txt
+          echo "Datawarehouse component folders:"; cat datawarehouse_changed_items.txt
+
+      - name: Copy Lakehouse Data and semantic model
+        continue-on-error: true
+        run: |
+          cat lakehouse_changed_items.txt
+
+          while read item; do
+              if [[ -z "$item" ]]; then continue; fi
+              echo "Creating $item in target workspace"
+              fab create "$TargetWorkspace.Workspace/$item" -P enableschemas=true
+              SOURCE_PATH="$SourceWorkspace.Workspace/$item/Files"
+              TARGET_PATH="$TargetWorkspace.Workspace/$item/Files"
+              for sub_item in $(fab ls "$SOURCE_PATH"); do
+                echo "Copying $sub_item Files folder to target workspace..."
+                fab cp "$SOURCE_PATH/$sub_item" "$TARGET_PATH/" -f
+              done
+          done < lakehouse_changed_items.txt
+
+          while read item; do
+            if [[ -z "$item" ]]; then continue; fi
+            echo "Copying: $item in target workspace"
+            fab cp "$SourceWorkspace.Workspace/$item" "$TargetWorkspace.Workspace/$item" -f
+          done < semantic_model_changed_items.txt
+
+      - name: Extract changed Notebook items from commit and run script for each
+        run: |
+          echo "SourceWorkspace=$SourceWorkspace"
+          echo "TargetWorkspace=$TargetWorkspace"
+          echo "Notebook items found in commit:"
+          cat notebook_changed_items.txt
+
+          while read item; do
+              if [[ -z "$item" ]]; then continue; fi
+              echo "Processing: $item"
+              full_base_path=$(dirname "$item")
+              echo "full base path: $full_base_path"
+              last_dir=$(basename "$full_base_path")
+              echo "last dir: $last_dir"
+              notebook_name=${last_dir%%.*}
+              base_path=$(echo "$item" | cut -d'/' -f1)
+              notebook_file=$(basename "$item")
+              echo "Extracted base path: $base_path"
+              echo "Notebookfile: $notebook_file"
+
+              target_dir="/$TargetWorkspace.Workspace/$base_path"
+              source_file="$SourceWorkspace.Workspace/$notebook_file"
+              target_file="$TargetWorkspace.Workspace/$notebook_file"
+
+              echo "Copying: $source_file to $target_file"
+              fab cp "$source_file" "$target_file" -f || echo "Failed to copy $item"
+
+              source_file="$SourceWorkspace.Workspace/$item"
+              target_file="$TargetWorkspace.Workspace/$item"
+
+              python folder_creation.py --folder_path "$item"
+
+          cat <<EOF > extract_lakehouse_names.py
+          import os
+          import re
+          import subprocess
+          import json
+
+          pattern_name = re.compile(r'"default_lakehouse_name"\\s*:\\s*"([^"]+)"')
+          notebook_folder = "$item"
+          notebook_file = "$notebook_file"
+          path = os.path.join(notebook_folder, "notebook-content.py")
+          if os.path.exists(path):
+              lakehouse_name = None
+              with open(path, encoding="utf-8") as f:
+                  for line in f:
+                      if "# META" in line:
+                          name_match = pattern_name.search(line)
+                          if name_match:
+                              lakehouse_name = name_match.group(1)
+                              break
+              if lakehouse_name:
+                  print(f"Lakehouse: {lakehouse_name}, Notebook: {notebook_folder}")
+              else:
+                  print("Lakehouse name not found in the notebook.")
+              if lakehouse_name:
+                  lakehouse_path = f"fab get /$TargetWorkspace.Workspace/{lakehouse_name}.Lakehouse -q id"
+                  print("Target Lakehouse ID:")
+                  command = ["fab", "get", f"/$TargetWorkspace.Workspace/{lakehouse_name}.Lakehouse", "-q", "id"]
+                  x = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                  stdout_single_line = x.stdout.strip().replace('\n', ' ')
+                  print(stdout_single_line)
+
+                  print("Target Workspace ID:")
+                  command = ["fab", "get", "/$TargetWorkspace.Workspace", "-q", "id"]
+                  w = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                  stdout_single_line2 = w.stdout.strip().replace('\n', ' ')
+                  print(stdout_single_line2)
+                  if w.stderr:
+                      print("Error:", w.stderr)
+
+                  print("Attach Lakehouse with notebook")
+                  known_lakehouses = [{"id": f"{stdout_single_line}"}]
+                  command_input = {
+                      "known_lakehouses": known_lakehouses,
+                      "default_lakehouse": f"{stdout_single_line}",
+                      "default_lakehouse_name": f"{lakehouse_name}",
+                      "default_lakehouse_workspace_id": f"{stdout_single_line2}"
+                  }
+                  command_input_json = json.dumps(command_input)
+
+                  attachcommand = ["fab", "set", "/$TargetWorkspace.Workspace/", f"{notebook_file}", "-q", "lakehouse", "-i", command_input_json, "-f"]
+                  a = subprocess.run(attachcommand, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+                  print(' '.join(attachcommand))
+                  stdout_single_line3 = a.stdout.strip().replace('\n', ' ')
+                  print(stdout_single_line3)
+                  if a.stderr:
+                      print("Error:", w.stderr)
+              else:
+                  print("Lakehouse name not found in the notebook.")
+          else:
+              print(f"Error: {path} does not exist.")
+          EOF
+              python3 extract_lakehouse_names.py
+          done < notebook_changed_items.txt
+
+      - name: Extract changed Semantic Model and Report
+        run: |
+          echo "Report items found in commit:"
+          cat report_changed_items.txt
+          echo "Semantic Model items found in commit:"
+          cat semantic_model_changed_items.txt
+
+          while read item; do
+              if [[ -z "$item" ]]; then continue; fi
+              echo "Copying: $item"
+              fab cp "$SourceWorkspace.Workspace/$item" "$TargetWorkspace.Workspace/$item" -f
+              report_folder=$(basename "$item")
+              definition_path="$item/definition.pbir"
+              echo "Creating Semantic model name extractor..."
+
+              cat <<EOF > extract_report_names.py
+          import os
+          import re
+          import json
+          import subprocess
+
+          pattern_model = re.compile(r'"path"\\s*:\\s*"\.\./([^"]+\.SemanticModel)"')
+
+          report_folder = "$report_folder"
+
+          path = os.path.join(report_folder, "definition.pbir")
+          print(f"Full path to definition.pbir: {path}")
+          if os.path.exists(path):
+              semantic_model_name = None
+              with open(path, encoding="utf-8") as f:
+                  content = f.read()
+                  match = pattern_model.search(content)
+                  if match:
+                      semantic_model_name = match.group(1)
+                      if semantic_model_name:
+                          print(f"Semantic Model: {semantic_model_name}")
+                      else:
+                          print("Semantic model name not found in the report.")
+          else:
+              print("definition.pbir not found.")
+
+          if semantic_model_name:
+              command = ["fab", "get", f"/$TargetWorkspace.Workspace/{semantic_model_name}", "-q", "id"]
+              m = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+              stdout_semantic = m.stdout.strip().replace('\n', ' ')
+              print(stdout_semantic)
+
+              print("Attaching Semantic Model to Report ")
+              attachsmcommand = ["fab", "set", f"/$TargetWorkspace.Workspace/{report_folder}", "-q", "semanticModelId", "-i", stdout_semantic, "-f"]
+              sm = subprocess.run(attachsmcommand, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+              print(sm)
+              print(' '.join(attachsmcommand))
+              stdout_single_line4 = sm.stdout.strip().replace('\n', ' ')
+              print(stdout_single_line4)
+              if sm.stderr:
+                  print("Error:", sm.stderr)
+          EOF
+              echo "Running report name extractor..."
+              python3 extract_report_names.py
+          done < report_changed_items.txt
+
+      - name: Semantic Model
+        run: |
+          echo "Semantic Model items found in commit:"
+          cat semantic_model_changed_items.txt
+          echo "Lakehouse items from changed files..."
+          cat lakehouse_changed_items.txt
+          mapfile -t LAKEHOUSES < lakehouse_changed_items.txt
+
+          while read semantic_item; do
+              if [[ -z "$semantic_item" ]]; then continue; fi
+              echo "Checking for Semantic Model: $semantic_item"
+
+              semantic_name=$(basename "$semantic_item" .SemanticModel)
+              echo "Semantic name: $semantic_name"
+              full_endpoint=$(fab get "$TargetWorkspace.Workspace/$semantic_item" -q connections[0].connectionDetails.path -f | grep -i 'datawarehouse.fabric.microsoft.com')
+              echo "full endpoint: $full_endpoint"
+
+              IFS=';' read -r sm_connection_string sm_endpoint_id <<< "$full_endpoint"
+              sm_connection_string=$(echo "$sm_connection_string" | tr '[:upper:]' '[:lower:]')
+              sm_endpoint_id=$(echo "$sm_endpoint_id" | xargs)
+
+              echo "  Parsed Semantic Model connection string: $sm_connection_string"
+              echo "  Parsed Semantic Model endpoint ID: $sm_endpoint_id"
+
+              matched_lakehouse=""
+
+              for lakehouse in "${LAKEHOUSES[@]}"; do
+                  echo "  Checking Lakehouse: $lakehouse"
+
+                  lh_connection_string=$(fab get "$SourceWorkspace.Workspace/$lakehouse" -q properties.sqlEndpointProperties.connectionString)
+                  lh_endpoint_id=$(fab get "$SourceWorkspace.Workspace/$lakehouse" -q properties.sqlEndpointProperties.id)
+
+                  lh_connection_string=$(echo "$lh_connection_string" | tr '[:upper:]' '[:lower:]')
+                  lh_endpoint_id=$(echo "$lh_endpoint_id" | xargs)
+
+                  echo "    Lakehouse connection string: $lh_connection_string"
+                  echo "    Lakehouse endpoint ID: $lh_endpoint_id"
+
+                  if [[ "$sm_endpoint_id" == "$lh_endpoint_id" ]]; then
+                      echo "    Match found: $semantic_name matches Lakehouse $lakehouse"
+                      matched_lakehouse="$lakehouse"
+                      break
+                  else
+                      echo "    No match with $lakehouse"
+                  fi
+              done
+
+              if [[ -z "$matched_lakehouse" ]]; then
+                  echo "No matching source Lakehouse found for $semantic_name"
+                  continue
+              fi
+
+              echo "Looking up Target Lakehouse: $matched_lakehouse"
+
+              raw_conn_str=$(fab get "$TargetWorkspace.Workspace/$matched_lakehouse" -q properties.sqlEndpointProperties.connectionString | tr -d '\n\r' | tr '[:upper:]' '[:lower:]' | xargs)
+              target_endpoint_id=$(fab get "$TargetWorkspace.Workspace/$matched_lakehouse" -q properties.sqlEndpointProperties.id | tr -d '\n\r' | xargs)
+
+              raw_conn_str=$(echo "$raw_conn_str" | tr '[:upper:]' '[:lower:]')
+              target_endpoint_id=$(echo "$target_endpoint_id" | xargs)
+
+              echo "  Target Lakehouse connection string: $raw_conn_str"
+              echo "   Target Lakehouse endpoint ID: $target_endpoint_id"
+
+              subdomain=${raw_conn_str%%.*}
+              uppercase_subdomain=$(echo "$subdomain" | tr '[:lower:]' '[:upper:]')
+              rest_of_domain=${raw_conn_str#*.}
+              target_conn_str="${uppercase_subdomain}.${rest_of_domain}"
+
+              target_full_endpoint="${target_conn_str};${target_endpoint_id}"
+
+              echo "Final target Lakehouse endpoint string: ${target_full_endpoint}"
+
+              echo "$target_full_endpoint" > target_lakehouse_connection.txt
+              echo "targetLakehouseConnection=$target_full_endpoint" >> "$GITHUB_ENV"
+              echo ""
+
+              echo "Updating expressions.tmdl for $semantic_name with the new connection string..."
+
+              file_path="$semantic_name.SemanticModel/definition/expressions.tmdl"
+
+              if grep -q 'Sql.Database(' "$file_path"; then
+                  echo "Found Sql.Database pattern in the file."
+              else
+                  echo "Sql.Database pattern not found. Exiting."
+                  exit 1
+              fi
+
+              sed -i "s|.*Sql\.Database.*|            database = Sql.Database(\"$target_conn_str\", \"$target_endpoint_id\")|" "$file_path"
+
+              echo "Replacement complete. Updated content:"
+              cat "$file_path"
+
+              echo "File Updated..."
+          done < semantic_model_changed_items.txt
+
+      - name: Get Source and Target Workspace IDs
+        run: |
+          echo "Fetching Source and Target workspaceIds..."
+          echo "SourceWorkspace: $SourceWorkspace"
+          echo "TargetWorkspace: $TargetWorkspace"
+
+          sourceWsId=$(fab get "/$SourceWorkspace.Workspace" -q id)
+          targetWsId=$(fab get "/$TargetWorkspace.Workspace" -q id)
+
+          echo "Source Workspace ID: $sourceWsId"
+          echo "Target Workspace ID: $targetWsId"
+
+          echo "SourceWorkspaceId=$sourceWsId" >> "$GITHUB_ENV"
+          echo "TargetWorkspaceId=$targetWsId" >> "$GITHUB_ENV"
+
+      - name: Update Data Pipeline workspace references
+        env:
+          SourceWorkspaceId: ${{ env.SourceWorkspaceId }}
+          TargetWorkspaceId: ${{ env.TargetWorkspaceId }}
+        run: |
+          python - <<'PYEOF'
+          import os
+          import json
+
+          source_workspace_id = os.environ.get("SourceWorkspaceId")
+          target_workspace_id = os.environ.get("TargetWorkspaceId")
+
+          if not source_workspace_id or not target_workspace_id:
+              raise ValueError("Missing SourceWorkspaceId or TargetWorkspaceId environment variable.")
+
+          notebook_ids = []
+          workspace_ids = []
+
+          with open("datapipeline_changed_items.txt", "r") as f:
+              pipeline_dirs = [line.strip() for line in f.readlines() if line.strip()]
+
+          for pipeline_dir in pipeline_dirs:
+              content_path = os.path.join(pipeline_dir, "pipeline-content.json")
+              if not os.path.exists(content_path):
+                  print(f"[WARN] Missing pipeline-content.json in {pipeline_dir}")
+                  continue
+
+              print(f"[INFO] Processing: {pipeline_dir}")
+              with open(content_path, "r") as f:
+                  data = json.load(f)
+
+              modified = False
+              activities = data.get("properties", {}).get("activities", [])
+
+              for activity in activities:
+                  type_props = activity.get("typeProperties", {})
+
+                  notebook_id = type_props.get("notebookId")
+                  workspace_id = type_props.get("workspaceId")
+
+                  if notebook_id:
+                      notebook_ids.append(notebook_id)
+                  if workspace_id:
+                      workspace_ids.append(workspace_id)
+
+                  if workspace_id in [None, "00000000-0000-0000-0000-000000000000"]:
+                      print(f"[INFO] Placeholder or null matched in {pipeline_dir}, replacing with TargetWorkspaceId")
+                      type_props["workspaceId"] = target_workspace_id
+                      modified = True
+                  else:
+                      print(f"[INFO] Workspace ID already set: {workspace_id}")
+
+              if modified:
+                  print("[INFO] Updated JSON content:")
+                  print(json.dumps(data, indent=2))
+
+                  with open(content_path, "w") as f:
+                      json.dump(data, f, indent=2)
+                  print("[INFO] pipeline-content.json updated.")
+              else:
+                  print("[INFO] No changes made to pipeline-content.json")
+          PYEOF
+
+      - name: Upload drop artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: drop
+          path: ${{ github.workspace }}
+          include-hidden-files: true
+
+  # ---------------------------------------------------------------------
+  # STAGE: deploy
+  # ---------------------------------------------------------------------
+  deploy:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - name: Download drop artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: drop
+          path: ${{ github.workspace }}\artifacts\drop\s
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11.9'
+          architecture: 'x64'
+
+      - name: Upgrade pip and install fabric-cicd
+        run: |
+          # Pinned to 0.1.7: later versions (e.g. 0.1.16) had a bug that auto-created
+          # an extra folder in the target workspace and deployed the item into it.
+          python -m pip install --upgrade pip
+          pip install fabric-cicd==0.1.7
+
+      - name: Check if semantic_model_changed_items.txt is not empty
+        id: CheckSemanticFile
+        shell: pwsh
+        run: |
+          $filePath = "${{ github.workspace }}\artifacts\drop\s\semantic_model_changed_items.txt"
+          if ((Test-Path $filePath) -and ((Get-Content $filePath | Where-Object { $_.Trim() -ne "" }).Length -gt 0)) {
+            "RunDeployScript=true" | Out-File -FilePath $env:GITHUB_ENV -Append
+          } else {
+            "RunDeployScript=false" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+
+      - name: Executing Python Script
+        if: ${{ env.RunDeployScript == 'true' }}
+        run: |
+          python "${{ github.workspace }}\artifacts\drop\s\${{ github.ref_name }}.py" --repository_directory "${{ github.workspace }}\artifacts\drop\s\"
+
+      - name: Upload Files artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Files
+          path: ${{ github.workspace }}\artifacts
+          include-hidden-files: true
+
+  # ---------------------------------------------------------------------
+  # STAGE: Datapipeline
+  # ---------------------------------------------------------------------
+  datapipeline:
+    needs: deploy
+    runs-on: windows-latest
+    steps:
+      - name: Download Files artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Files
+          path: ${{ github.workspace }}\artifacts
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11.9'
+          architecture: 'x64'
+
+      - name: Upgrade pip and Install Fabric-CLI
+        run: |
+          python -m pip install --upgrade pip
+          pip install ms-fabric-cli
+          pip install argparse
+          pip install requests
+          pip install azure.identity
+          pip install fabric-cicd==0.1.19
+          pip install colorama
+
+      - name: Determine Source and Target Workspaces
+        shell: pwsh
+        run: |
+          Write-Host "##[group]Branch Workspace Mapping"
+          $branchName = "${{ github.ref_name }}"
+          Write-Host "Detected Branch: $branchName"
+
+          if ($branchName -eq "main") {
+            "SourceWorkspace=dev-fab" | Out-File -FilePath $env:GITHUB_ENV -Append
+            "TargetWorkspace=Notebbok_fabric-CLI" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+          # elseif ($branchName -eq "uat") {
+          #   "SourceWorkspace=GIT-POC-DEV" | Out-File -FilePath $env:GITHUB_ENV -Append
+          #   "TargetWorkspace=GIT-POC-UAT" | Out-File -FilePath $env:GITHUB_ENV -Append
+          # }
+          else {
+            Write-Error "Unsupported branch: $branchName"
+            exit 1
+          }
+          Write-Host "##[endgroup]"
+
+      - name: List artifact content
+        shell: cmd
+        run: |
+          dir "${{ github.workspace }}\artifacts\drop\s\"
+
+      - name: Check if datapipeline_changed_items.txt is not empty
+        id: CheckSemanticFile
+        shell: pwsh
+        run: |
+          $filePath = "${{ github.workspace }}\artifacts\drop\s\datapipeline_changed_items.txt"
+          if ((Test-Path $filePath) -and ((Get-Content $filePath | Where-Object { $_.Trim() -ne "" }).Length -gt 0)) {
+            "RunDeployScript=true" | Out-File -FilePath $env:GITHUB_ENV -Append
+          } else {
+            "RunDeployScript=false" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+
+      - name: Executing Python Script
+        if: ${{ env.RunDeployScript == 'true' }}
+        continue-on-error: true
+        run: |
+          python "${{ github.workspace }}\artifacts\drop\s\datapipeline.py" --repository_directory "${{ github.workspace }}\artifacts\drop\s\"
+
+      - name: Show Error Log
+        shell: cmd
+        run: |
+          type "D:\a\1\s\fabric_cicd.error.log"
+
+      - name: Datapipeline Migration
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "SourceWorkspace=$SourceWorkspace"
+          echo "TargetWorkspace=$TargetWorkspace"
+          echo "Data Pipeline items found in commit:"
+          cat "${{ github.workspace }}/artifacts/drop/s/datapipeline_changed_items.txt"
+
+          while read item; do
+              if [[ -z "$item" ]]; then continue; fi
+
+              echo "Processing: $item"
+              datapipeline_file=$(basename "$item")
+              echo "Datapipeline file: $datapipeline_file"
+
+              source_file="$SourceWorkspace.Workspace/$item"
+              target_file="$TargetWorkspace.Workspace/$item"
+
+              echo "Creating folder structure and migrating: $source_file → $target_file"
+
+              python "${{ github.workspace }}/artifacts/drop/s/folder_creation_DataPipeline.py" --folder_path "$item"
+
+          done < "${{ github.workspace }}/artifacts/drop/s/datapipeline_changed_items.txt"
+
+      - name: Print JSON content of each Data Pipeline
+        shell: pwsh
+        run: |
+          $fileList = Get-Content "${{ github.workspace }}\artifacts\drop\s\datapipeline_changed_items.txt" | Where-Object { $_.Trim() -ne "" }
+
+          foreach ($path in $fileList) {
+            $fullPath = Join-Path "${{ github.workspace }}\artifacts\drop\s" "$path\pipeline-content.json"
+            if (Test-Path $fullPath) {
+              Write-Host "======================"
+              Write-Host "Pipeline: $path"
+              Write-Host "----------------------"
+              Get-Content $fullPath | ForEach-Object { Write-Host $_ }
+              Write-Host "======================`n"
+            } else {
+              Write-Host "Missing pipeline-content.json at: $fullPath"
+            }
+          }
