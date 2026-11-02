@@ -46,16 +46,17 @@ jobs:
       - name: Configure Fabric CLI
         run: fab config set encryption_fallback_enabled true
 
-      - name: Fabric CLI Login using Federated Token
+      - name: Test Microsoft Entra Federated Authentication
         shell: bash
         env:
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
           TENANT_ID: ${{ secrets.TENANT_ID }}
         run: |
           set -euo pipefail
-          fab auth logout || true
-          fab auth login -u "$CLIENT_ID" --federated-token "$FEDERATED_TOKEN" --tenant "$TENANT_ID"
-          fab auth status
+          echo "Testing GitHub OIDC token exchange with Microsoft Entra ID..."
+          az login --service-principal --username "$CLIENT_ID" --tenant "$TENANT_ID" --federated-token "$FEDERATED_TOKEN" --allow-no-subscriptions --output none
+          echo "Microsoft Entra federated authentication successful."
+          az account show --query "{tenantId:tenantId,user:user.name}" --output table
 
       - name: Verify Fabric Workspace Access
         run: fab ls
