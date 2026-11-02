@@ -33,25 +33,14 @@ jobs:
         id: id-token
         with:
           script: |
-            // Request OIDC token with Entra ID audience
-            const id_token = await core.getIDToken(
-              'api://AzureADTokenExchange'
-            );
-
-            // Mask token in workflow logs
-            core.setSecret(id_token);
-
-            // Pass token to next step
-            core.setOutput('id_token', id_token);
+            let id_token = await core.getIDToken('api://AzureADTokenExchange')
+            core.setOutput('id_token', id_token)
 
       - name: Run Fabric CLI Commands
         env:
           FEDERATED_TOKEN: ${{ steps.id-token.outputs.id_token }}
         run: |
-          fab auth login \
-            -u "$CLIENT_ID" \
-            --tenant "$TENANT_ID" \
-            --federated-token "$FEDERATED_TOKEN"
+          fab auth login -u "$CLIENT_ID" --tenant "$TENANT_ID" --federated-token "$FEDERATED_TOKEN"
 
       # Step 5: Verify Fabric Authentication
       - name: Verify Fabric Authentication
