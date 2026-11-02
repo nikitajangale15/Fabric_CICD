@@ -39,6 +39,9 @@ jobs:
           echo "FEDERATED_TOKEN=$FEDERATED_TOKEN" >> "$GITHUB_ENV"
           echo "GitHub OIDC token fetched successfully."
 
+      - name: Enable Fabric CLI Encryption Fallback
+        run: fab config set encryption_fallback_enabled true
+
       - name: Fabric CLI Login
         shell: bash
         env:
