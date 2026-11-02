@@ -13,9 +13,8 @@ jobs:
 
     environment: FABRIC-UAT
     env:
-      CLIENT_ID: ${{ vars.CLIENT_ID }}
-      TENANT_ID: ${{ vars.TENANT_ID }}
-
+      CLIENT_ID: ${{ secrets.CLIENT_ID }}
+      TENANT_ID: ${{ secrets.TENANT_ID }}
     steps:
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -40,7 +39,7 @@ jobs:
         env:
           FEDERATED_TOKEN: ${{ steps.id-token.outputs.id_token }}
         run: |
-          fab auth login -u "${{ vars.CLIENT_ID }}" --tenant "${{ vars.TENANT_ID }}" --federated-token "$FEDERATED_TOKEN"
+          fab auth login -u "$CLIENT_ID" --tenant "$TENANT_ID" --federated-token "$FEDERATED_TOKEN"
 
       # Step 5: Verify Fabric Authentication
       - name: Verify Fabric Authentication
