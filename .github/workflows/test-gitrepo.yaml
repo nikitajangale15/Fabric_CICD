@@ -1,0 +1,64 @@
+
+name: Fabric CLI OIDC Authentication
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  fabric-auth:
+    name: Fabric CLI Login
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Fabric CLI
+        run: python -m pip install --upgrade pip && python -m pip install --upgrade ms-fabric-cli && fab --version
+
+      - name: Fetch GitHub OIDC Token
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const token = await core.getIDToken('api://AzureADTokenExchange');
+            core.setSecret(token);
+            core.exportVariable('FEDERATED_TOKEN', token);
+            core.info('GitHub OIDC token fetched successfully.');
+
+      - name: Diagnose GitHub OIDC Claims
+        shell: bash
+        run: python -c 'import os,json,base64; t=os.environ["FEDERATED_TOKEN"]; p=t.split(".")[1]; p+="="*(-len(p)%4); d=json.loads(base64.urlsafe_b64decode(p)); print(json.dumps({k:d.get(k) for k in ["iss","aud","sub","repository","repository_id","repository_owner_id","ref","workflow_ref"]},indent=2))'
+
+      - name: Configure Fabric CLI
+        run: fab config set encryption_fallback_enabled true
+
+      - name: Fabric CLI Login using Federated Token
+        shell: bash
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          TENANT_ID: ${{ secrets.TENANT_ID }}
+        run: |
+          set -euo pipefail
+          fab auth logout || true
+          fab auth login -u "$CLIENT_ID" --federated-token "$FEDERATED_TOKEN" --tenant "$TENANT_ID"
+          fab auth status
+
+      - name: Verify Fabric Workspace Access
+        run: fab ls
+
+      - name: Cleanup Authentication Token
+        if: always()
+        run: echo "FEDERATED_TOKEN=" >> "$GITHUB_ENV"
