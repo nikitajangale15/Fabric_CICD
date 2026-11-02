@@ -4,86 +4,54 @@ name: Fabric CLI OIDC Authentication
 on:
   workflow_dispatch:
 
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
-  authenticate:
-    name: Authenticate with Microsoft Fabric
+  fabric-auth:
+    name: Fabric CLI Login
     runs-on: ubuntu-latest
 
-    permissions:
-      id-token: write
-      contents: read
-
-    environment: FABRIC-UAT
-
-    env:
-      CLIENT_ID: ${{ secrets.CLIENT_ID }}
-      TENANT_ID: ${{ secrets.TENANT_ID }}
-
     steps:
-      # Step 1: Set up Python
-      - name: Set up Python
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
 
-      # Step 2: Install Fabric CLI
       - name: Install Fabric CLI
-        run: |
-          python -m pip install --upgrade pip
-          pip install ms-fabric-cli
-          fab --version
+        run: python -m pip install --upgrade pip && python -m pip install ms-fabric-cli && fab --version
 
-      # Step 3: Validate Configuration
-      - name: Validate Configuration
+      - name: Fetch GitHub OIDC Token
+        id: get-token
         shell: bash
         run: |
-          if [ -z "$CLIENT_ID" ]; then
-            echo "::error::CLIENT_ID secret is missing"
-            exit 1
-          fi
+          FEDERATED_TOKEN=$(curl --fail --silent --show-error -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" | jq -r '.value')
+          if [[ -z "$FEDERATED_TOKEN" || "$FEDERATED_TOKEN" == "null" ]]; then echo "Failed to fetch GitHub OIDC token"; exit 1; fi
+          echo "::add-mask::$FEDERATED_TOKEN"
+          echo "FEDERATED_TOKEN=$FEDERATED_TOKEN" >> "$GITHUB_ENV"
+          echo "GitHub OIDC token fetched successfully."
 
-          if [ -z "$TENANT_ID" ]; then
-            echo "::error::TENANT_ID secret is missing"
-            exit 1
-          fi
-
-          echo "Client ID and Tenant ID are configured."
-
-      # Step 4: Generate GitHub OIDC Federated Token
-      - name: Authenticate with OIDC Federated Token
-        uses: actions/github-script@v7
-        id: id-token
-        with:
-          script: |
-            const id_token = await core.getIDToken(
-              'api://AzureADTokenExchange'
-            );
-
-            core.setSecret(id_token);
-            core.setOutput('id_token', id_token);
-
-      # Step 5: Configure Fabric CLI Authentication
-      - name: Configure Fabric CLI
-        run: |
-          fab config set encryption_fallback_enabled true
-          fab config set context_persistence_enabled false
-
-      # Step 6: Authenticate with Fabric CLI
-      - name: Run Fabric CLI Commands
+      - name: Fabric CLI Login
         shell: bash
         env:
-          FEDERATED_TOKEN: ${{ steps.id-token.outputs.id_token }}
-        run: |
-          fab auth login --u "$CLIENT_ID" --tenant "$TENANT_ID" --federated-token "$FEDERATED_TOKEN"
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          TENANT_ID: ${{ secrets.TENANT_ID }}
+        run: fab auth login -u "$CLIENT_ID" --federated-token "$FEDERATED_TOKEN" --tenant "$TENANT_ID"
 
-      # Step 7: Verify Authentication
       - name: Verify Fabric Authentication
-        shell: bash
-        run: |
-          fab auth status
+        run: fab auth status
 
-      # Step 8: Verify Fabric Workspace Access
       - name: Verify Fabric Workspace Access
-        shell: bash
-        run: |
-          fab ls
+        run: fab ls
+
+      - name: Cleanup
+        if: always()
+        run: echo "FEDERATED_TOKEN=" >> "$GITHUB_ENV"
