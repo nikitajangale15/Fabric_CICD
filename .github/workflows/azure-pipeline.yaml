@@ -27,32 +27,39 @@ jobs:
           python-version: '3.11'
 
       - name: Install Fabric CLI
-        run: python -m pip install --upgrade pip && python -m pip install ms-fabric-cli && fab --version
+        run: python -m pip install --upgrade pip && python -m pip install --upgrade ms-fabric-cli && fab --version
 
       - name: Fetch GitHub OIDC Token
-        id: get-token
         shell: bash
         run: |
+          set -euo pipefail
           FEDERATED_TOKEN=$(curl --fail --silent --show-error -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" | jq -r '.value')
-          if [[ -z "$FEDERATED_TOKEN" || "$FEDERATED_TOKEN" == "null" ]]; then echo "Failed to fetch GitHub OIDC token"; exit 1; fi
+          if [[ -z "$FEDERATED_TOKEN" || "$FEDERATED_TOKEN" == "null" ]]; then echo "Failed to fetch OIDC token"; exit 1; fi
           echo "::add-mask::$FEDERATED_TOKEN"
           echo "FEDERATED_TOKEN=$FEDERATED_TOKEN" >> "$GITHUB_ENV"
-          echo "GitHub OIDC token fetched successfully."
+          echo "OIDC token fetched successfully."
 
-      - name: Enable Fabric CLI Encryption Fallback
-        run: fab config set encryption_fallback_enabled true
+      - name: Diagnose GitHub OIDC Claims
+        shell: bash
+        run: python -c 'import os,json,base64; t=os.environ["FEDERATED_TOKEN"]; p=t.split(".")[1]; p+="="*(-len(p)%4); d=json.loads(base64.urlsafe_b64decode(p)); print(json.dumps({k:d.get(k) for k in ["iss","aud","sub","repository","ref","workflow_ref"]},indent=2))'
 
-      - name: Fabric CLI Login
+      - name: Configure Fabric CLI Authentication
         shell: bash
         env:
-          CLIENT_ID: ${{ secrets.CLIENT_ID }}
-          TENANT_ID: ${{ secrets.TENANT_ID }}
-        run: fab auth logout || true; fab auth login -u "$CLIENT_ID" --federated-token "$FEDERATED_TOKEN" --tenant "$TENANT_ID" && fab auth status
-
-      - name: Verify Fabric Authentication
-        run: fab auth status
+          FAB_SPN_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          FAB_TENANT_ID: ${{ secrets.TENANT_ID }}
+          FAB_SPN_FEDERATED_TOKEN: ${{ env.FEDERATED_TOKEN }}
+        run: |
+          set -euo pipefail
+          fab config set encryption_fallback_enabled true
+          fab auth status
+          echo "Fabric CLI authentication configuration completed."
 
       - name: Verify Fabric Workspace Access
+        env:
+          FAB_SPN_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          FAB_TENANT_ID: ${{ secrets.TENANT_ID }}
+          FAB_SPN_FEDERATED_TOKEN: ${{ env.FEDERATED_TOKEN }}
         run: fab ls
 
       - name: Cleanup
