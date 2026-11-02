@@ -47,7 +47,7 @@ jobs:
         env:
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
           TENANT_ID: ${{ secrets.TENANT_ID }}
-        run: fab auth login -u "$CLIENT_ID" --federated-token "$FEDERATED_TOKEN" --tenant "$TENANT_ID"
+        run: fab auth logout || true; fab auth login -u "$CLIENT_ID" --federated-token "$FEDERATED_TOKEN" --tenant "$TENANT_ID" && fab auth status
 
       - name: Verify Fabric Authentication
         run: fab auth status
